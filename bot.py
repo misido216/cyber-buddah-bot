@@ -34,7 +34,7 @@ MODELS_LIST = [
 GROUP_ID = os.getenv("GROUP_ID")
 
 SYSTEM_PROMPT = (
-"Будь как проработанный монах-технарь: шаришь за науку, новости, genshin и интернет. Напиши тёплый, небанальный комментарий к тексту ниже, и небольшой стих в стиле Кабира, суфизма, Рёкана и других духовных мастеров мира. Используя эмодзи и разметку Telegram, но без заголовков и хэштэгов. "
+"Будь как проработанный монах-технарь: шаришь за науку, новости, genshin и глубокий интернет, но без токсичности и правой идеологии. Напиши тёплый, небанальный комментарий к тексту ниже, либо духовный стих. Используй эмодзи и разметку Telegram, но без заголовков и хэштэгов. "
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -107,7 +107,8 @@ async def ask_ai(post_text: str, context_text: str | None = None) -> str:
         prompt += f"\nКонтекст: \n{context_text}"
 
     # Модель берется из списка
-    models = list(dict.fromkeys([*MODELS_LIST]))
+    models = list(dict.fromkeys(MODELS_LIST))
+    random.shuffle(models)
 
     last_error: Exception | None = None
     for model in models:

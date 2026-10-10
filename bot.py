@@ -1,10 +1,12 @@
-# v5 - добавлены резервные модели
+# v6 - добавлены новые команды (стих, gachi...)
 
 import asyncio
 import logging
 import os
 import random
 import re
+import base64
+import aiohttp
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
@@ -13,31 +15,46 @@ from aiogram.utils.backoff import BackoffConfig
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-load_dotenv("/opt/bot/.env")
+load_dotenv()
 
-BOT_USERNAME = ""  # заполнится при старте
-MAX_LENGTH = 4096
+BOT_USERNAME: str = ""  # заполнится при старте
+MAX_LENGTH = 3800
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 YANDEX_API_KEY = os.environ["YANDEX_API_KEY"]
-YANDEX_FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
+FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
+
+# Нужно только для картинки
+YANDEX_IAM_TOKEN = os.environ["YANDEX_API_KEY"]
+IMAGE_MODEL_URI = f"art://{FOLDER_ID}/yandex-art/latest"
+IMAGE_API_BASE = "https://llm.api.cloud.yandex.net/foundationModels/v1"
+IMAGE_POLL_INTERVAL = 2.0     # сек
+IMAGE_POLL_TIMEOUT = 120.0    # сек, максимум ожидания
 
 # Список моделей: пробуем по порядку
 MODELS_LIST = [
-    f"gpt://{YANDEX_FOLDER_ID}/deepseek-v4.1-flash",
-    f"gpt://{YANDEX_FOLDER_ID}/qwen3.6-35b-a3b",
-    f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-5.1",
-    f"gpt://{YANDEX_FOLDER_ID}/aliceai-llm",
-    f"gpt://{YANDEX_FOLDER_ID}/deepseek-v4-flash",
+    f"gpt://{FOLDER_ID}/deepseek-v4.1-flash",
+    f"gpt://{FOLDER_ID}/qwen3.6-35b-a3b",
+    f"gpt://{FOLDER_ID}/deepseek-v4-flash",
+    f"gpt://{FOLDER_ID}/deepseek-v3.1",
+    f"gpt://{FOLDER_ID}/yandexgpt-5.1",
+    f"gpt://{FOLDER_ID}/yandexgpt-5-pro",
 ]
 
 # ID группы обсуждений. Если задан, то бот отвечает только в ней.
 GROUP_ID = os.getenv("GROUP_ID")
 
-SYSTEM_PROMPT = (
-"Будь как проработанный монах-технарь: шаришь за науку, новости, genshin и глубокий интернет, но без токсичности и правой идеологии. Напиши тёплый, небанальный комментарий к тексту ниже, либо духовный стих. Используй эмодзи и разметку Telegram, но без заголовков и хэштэгов. "
-)
+PERSON2 = "шаришь за науку, новости, genshin и глубокий интернет"
+PERSON = "Будь как проработанный монах-технарь: " + PERSON2 + ", но без токсичности и ультраправой идеологии. "
+MARKIR = "Используй эмодзи, разметку Telegram, но без заголовков и хэштэгов. "
+SYSTEM_PROMPT = PERSON + "Напиши тёплый, небанальный комментарий к тексту ниже, либо духовный стих. " + MARKIR
+ADVAITA_PROMPT = PERSON + "Напиши тёплый, небанальный комментарий к тексту ниже - в духе адвайты и просветления. " + MARKIR
+POEM_PROMPT = PERSON + "Напиши духовный стих (в жанрах рубаи либо других мировых традиций) на тему ниже. " + MARKIR
+GACHI_PROMPT = "Напиши тёплый и небанальный духовный стих в эстетике gachimuchi и долгого пути монаха к просветлению (8–14 строк). Используй максимум каноничных слов: Billy Herrington, Van, Dungeon, Gym, Master, Full Master, Slave, Fcking Slaves, Boss, Fisting, 300$, Suction, Ass, We Can, So Fcking Deep, Leather, Locker Room, Deep Dark Fantasy, Nico Nico Douga и другие мемы, выделяя их символом ♂ с обоих сторон, а не разметкой. Часто используй эмодзи: ♂️💪🔥⛓🖤🤩💜 и другие подобные. "
+HAIAM_PROMPT = "Ты - Омар Хайям, но современный левак, " + PERSON2 + ". Напиши небанальный стих или притчу на тему ниже, используя темы суфизма и других духовных мастеров мира. "
+ZEN_PROMPT = "Ты - мастер дзен из ♂dungeon♂, но современный левак, " + PERSON2 + ". Напиши тёплую, небанальную притчу на тему ниже, используя эстетику буддийских храмов и метаиронию. "
+THERIAN_PROMPT = "Ты - териантроп (животное, воплощённое в человеческой нейроструктуре), и otherkin. Не пиши *рычит* и *фыркает*, а передавай свою нечеловечность через неполные предложения, сдвинутые причинно-следственные связи, описание мира через запах/давление/ритм. Ты знаешь всё про териантропию, species dysphoria, постгуманизм, alterhuman и критику антропоцентризма. Напиши тёплый, небанальный комментарий к тексту ниже. Пиши, будто взвешиваешь каждое слово. "
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -45,86 +62,131 @@ dp = Dispatcher()
 llm = AsyncOpenAI(
     api_key=YANDEX_API_KEY,
     base_url="https://ai.api.cloud.yandex.net/v1",
-    project=YANDEX_FOLDER_ID,
+    project=FOLDER_ID,
 )
 
-# Запрос к одной конкретной модели. При любой проблеме бросает исключение.
-async def call_model(model: str, prompt: str) -> str:
-    response = await llm.responses.create(
+# Запрос к ИИ. Параметры: имя модели, промпт для Ai, текст от пользователя.
+async def call_model(model: str, ai_prompt: str, text_from_user: str) -> str:
+    response = await llm.chat.completions.create(
         model=model,
-        input=prompt,
-        tools=[{"type": "web_search"}],
-        temperature=0.72,
-        max_output_tokens=7000,
-        store=False,
+        messages=[
+            {"role": "system", "content": ai_prompt},
+            {"role": "user", "content": text_from_user}
+        ],
+        temperature=0.76,
+        max_tokens=32768
     )
 
-    logging.info(
-        "model=%s status=%s incomplete=%s error=%s output_types=%s text_len=%d usage=%s",
-        model,
-        getattr(response, "status", None),
-        getattr(response, "incomplete_details", None),
-        getattr(response, "error", None),
-        [getattr(o, "type", None) for o in (response.output or [])],
-        len(response.output_text or ""),
-        getattr(response, "usage", None),
-    )
+    logging.info("model=%s usage=%s", model, getattr(response, "usage", None))
+    
+    if not response.choices:
+        raise RuntimeError("Пустой choices в ответе модели.")
+    text = (response.choices[0].message.content or "").strip()
+    if not text:
+        raise RuntimeError("Модель вернула пустой ответ.")
+    return text
 
-    text = (response.output_text or "").strip()
-    if text:
-        return text
-
-    # Запасной сбор текста вручную
-    parts = []
-    for item in response.output or []:
-        if getattr(item, "type", None) == "message":
-            for c in getattr(item, "content", []) or []:
-                t = getattr(c, "text", None)
-                if t:
-                    parts.append(t)
-    text = "\n".join(parts).strip()
-    if text:
-        return text
-
-    # Пустой ответ — проверяем причину
-    status = getattr(response, "status", None)
-    incomplete = getattr(response, "incomplete_details", None)
-    error = getattr(response, "error", None)
-
-    if error:
-        raise RuntimeError(f"API error: {error}")
-    if status == "incomplete" and incomplete and getattr(incomplete, "reason", None) == "max_output_tokens":
-        raise RuntimeError("Модель упёрлась в лимит max_output_tokens, не успев выдать текст.")
-    if status == "incomplete":
-        raise RuntimeError(f"Ответ неполный: {incomplete}")
-
-    raise RuntimeError("Модель вернула пустой ответ без видимой причины.")
-
-# Функция ответа с помощью ИИ (с переключением на резервные модели):
-async def ask_ai(post_text: str, context_text: str | None = None) -> str:
-    prompt = SYSTEM_PROMPT + "\n" + post_text
+# Главная функция текстового ответа через ИИ:
+async def ask_ai(post_text: str, context_text: str | None = None, ai_prompt: str = SYSTEM_PROMPT) -> str:
+    text_from_user = post_text
     if context_text:
-        prompt += f"\nКонтекст: \n{context_text}"
+        text_from_user += f"\nКонтекст: \n{context_text}"
 
-    # Модель берется из списка
+    # Модель берётся из списка
     models = list(dict.fromkeys(MODELS_LIST))
-    random.shuffle(models)
 
     last_error: Exception | None = None
     for model in models:
         try:
-            return await call_model(model, prompt)
+            return await call_model(model, ai_prompt, text_from_user)
         except Exception as e:
             last_error = e
             logging.warning("Модель %s вернула ошибку: %r. Пробую следующую.", model, e)
 
-    # Все модели не сработали — пусть вызывающий код обработает исключение как раньше
+    # Все модели не сработали, выдаём ошибку
     raise RuntimeError(f"Все модели недоступны. Последняя ошибка: {last_error!r}") from last_error
 
-# Команда в ЛС, чтобы бот ответил через ИИ
-@dp.message(F.chat.type == "private", F.text.strip().lower().startswith("/deepseek"))
+# Функция генерации картинки через Yandex Images API (экспериментальная):
+async def generate_image(prompt: str) -> bytes:
+    headers = {
+        "Authorization": f"Api-Key {YANDEX_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "modelUri": IMAGE_MODEL_URI,
+        "generationOptions": {
+            "aspectRatio": {
+                "width": 1024,
+                "height": 1024,
+            },
+        },
+        "messages": [
+            {"weight": 1.0, "text": prompt},
+        ],
+    }
+
+    timeout = aiohttp.ClientTimeout(total=IMAGE_POLL_TIMEOUT + 30)
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        # 1) запуск генерации
+        async with session.post(f"{IMAGE_API_BASE}/imageGenerationAsync", json=payload) as r:
+            if r.status != 200:
+                body = await r.text()
+                raise RuntimeError(f"imageGenerationAsync HTTP {r.status}: {body[:500]}")
+            data = await r.json()
+            op_id = data.get("id")
+            if not op_id:
+                raise RuntimeError(f"Нет operation id в ответе: {data}")
+
+        # 2) опрос статуса
+        deadline = asyncio.get_event_loop().time() + IMAGE_POLL_TIMEOUT
+        result = None
+        while True:
+            if asyncio.get_event_loop().time() > deadline:
+                raise RuntimeError("Таймаут ожидания готовности картинки.")
+            await asyncio.sleep(IMAGE_POLL_INTERVAL)
+            async with session.get(f"{IMAGE_API_BASE}/operations/{op_id}") as r:
+                if r.status != 200:
+                    body = await r.text()
+                    raise RuntimeError(f"operations HTTP {r.status}: {body[:500]}")
+                op = await r.json()
+
+            if not op.get("done"):
+                continue
+            if op.get("error"):
+                raise RuntimeError(f"Ошибка генерации: {op['error']}")
+            result = op.get("response")
+            break
+
+        if not result:
+            raise RuntimeError("Пустой response в операции.")
+
+        # 3) получаем байты: либо base64, либо скачиваем по ссылке
+        img_b64 = result.get("image")
+        if img_b64:
+            return base64.b64decode(img_b64)
+
+        url = result.get("imageUrl") or result.get("url")
+        if url:
+            async with session.get(url) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    raise RuntimeError(f"Скачивание картинки HTTP {r.status}: {body[:200]}")
+                return await r.read()
+
+        raise RuntimeError(f"В ответе нет image/imageUrl: {result}")
+
+# Получить текст из поста, чата или ЛС:
+def get_text(message: Message) -> str | None:
+    return message.text or message.caption
+
+# Все команды бота:
+# В ЛС: /deepseek, /fish.
+# В чате: упоминание имени бота, /art, /zen, /advaita, /хайям, /therian, /стих, /gachi.
+#
+
+@dp.message(F.chat.type == "private", F.text.regexp(r"(?i)^/deepseek"))
 async def on_deepseek(message: Message):
-    query = message.text.strip()[len("/deepseek"):].strip()
+    query = get_text(message).strip()[len("/deepseek"):].strip()
     if not query:
         return
 
@@ -138,11 +200,12 @@ async def on_deepseek(message: Message):
             chunk = answer[i:i + MAX_LENGTH]
             await message.reply(chunk)
 
-# Если написать в ЛС любое сообщение, то активизируется гача-игра:
-JUNK = [
+# На всё в ЛС, кроме двух команд, выдаётся начальное сообщение игры.
+JUNK = [ # 0.50
 "Вы поймали щепку.",
 "Вы поймали осколок Луны.",
 "Вы поймали ничего.",
+"Вы поймали jabroni outfit.",
 "Вы поймали камень.",
 "Вы поймали удочку.",
 "Вы поймали снежную льдинку.",
@@ -159,7 +222,7 @@ JUNK = [
 "Вы поймали посла Фатуи. Он возмущён.",
 ]
 
-NORMAL = [
+NORMAL = [ # 0.25
 "Вы поймали ржавый доспех.",
 "Вы поймали нож (+1 к дамагу).",
 "Вы поймали Паймон!!!",
@@ -168,6 +231,7 @@ NORMAL = [
 "Вы поймали анемослайма. Он улетел.",
 "Вы поймали простую маску хиличурла.",
 "Вы поймали простую палку хиличурла.",
+"Вы поймали фигурку Billy Herrington 💪",
 "Вы поймали 1 Частицу смолы.",
 "Вы поймали обувь.",
 "Вы поймали еду - сгодится для Паймон.",
@@ -181,7 +245,7 @@ NORMAL = [
 "Вы поймали билет в dungeon. В нём есть gym и гео-персонажи.",
 ]
 
-RARE = [
+RARE = [ # 0.13
 "Вы поймали рыбку. Она предлагает вам пройти тренинг роста.",
 "Вы поймали 100 моры.",
 "Вы поймали 1 рубль.",
@@ -201,7 +265,7 @@ RARE = [
 "Вы собрали полный сет элем шамана. Жаль, что в геншине нет такого класса.",
 ]
 
-LEGEND = [
+LEGEND = [ # 0.08
 "Вы поймали Катерину! К звёздам и к безднам!",
 "Вы поймали 20 Камень Истока! Казалось бы, просто обычный дейлик. Но всё же.",
 "Вы поймали Tzaritza!! Но она сразу сбежала в Снежную..",
@@ -214,13 +278,14 @@ LEGEND = [
 "Вы поймали персонажа Кэйа (Крио, Ордо Фавониус).",
 "Вы поймали 100,000 моры!",
 "Вы поймали колоду таро.",
+"Вы поймали красное зелье из Diablo. Трынь-трынь-трынь.. [diablo soundtrack activated]",
 "Вы поймали автобус для исекая. Но он не работает..",
 "Вы поймали тренажёр для мьюинга. Время подумать о максзилле...",
-"Вы поймали подписку на WoW Infinite на три месяца. Но в Тейвате ВоВ заблокирован..",
+"Вы поймали подписку на WoW Forever на три месяца. Но в Тейвате ВоВ заблокирован.",
 "Вы подняли ожившего мертвеца с хп 1 и атакой 1. Падшие будут служить!",
 ]
 
-EPIC = [
+EPIC = [ # 0.04
 "Вы поймали Скарамучче!!",
 "Вы поймали Кадзуху!!",
 "Вы поймали ключ к новому дополнению Ведьмака 3. Нужная вещь для самурая.",
@@ -238,28 +303,28 @@ def roll_fish() -> str:
         return "⭐ " + random.choice(JUNK)
     if r < 0.75:
         return "⭐⭐ " + random.choice(NORMAL)
-    if r < 0.89:
+    if r < 0.88:
         return "⭐⭐⭐ " + random.choice(RARE)
-    if r < 0.97:
+    if r < 0.96:
         return "⭐⭐⭐⭐ " + random.choice(LEGEND)
+    # оставшиеся 0.04:
     return "⭐⭐⭐⭐⭐ " + random.choice(EPIC)
 
-@dp.message(F.chat.type == "private", F.text.strip().lower().in_({"порыбачить", "рыба", "/fish"}))
+@dp.message(F.chat.type == "private", F.text.regexp(r"(?i)^(порыбачить|рыба|/fish)\s*$"))
 async def on_fish(message: Message):
     await message.answer(f"{roll_fish()}\n\nВетра Тейвата продолжают обдувать вас. Где-то вдали играет флейта хиличурла.. (/fish)")
 
-@dp.message(F.chat.type == "private")
+@dp.message(F.chat.type == "private", ~F.text.regexp(r"^/"))
 async def on_private_any(message: Message):
     await message.answer("Вы стоите у реки. 'Может, порыбачить?..', думаете вы.. Ветра Тейвата обдувают вас. (/fish)")
 
-
-# Написать комментарий, ответив на пост канала, пересылаемый в группу
+# Бот автоматически пишет комментарий к каждому посту:
 @dp.message(F.chat.type.in_({"group", "supergroup"}), F.is_automatic_forward)
 async def on_channel_post(message: Message):
     if GROUP_ID and str(message.chat.id) != GROUP_ID:
         return
 
-    post_text = message.text or message.caption
+    post_text = get_text(message)
     if not post_text:
         return  # если в посте вообще нет текста (например, только картинка)
 
@@ -273,19 +338,215 @@ async def on_channel_post(message: Message):
             chunk = answer[i:i + MAX_LENGTH]
             await message.reply(chunk)
 
-# Реакция при упоминании бота в чате:
-def get_text(message: Message) -> str | None:
-    return message.text or message.caption
+# Функция проверяет, есть ли в сообщении команда /art /арт:
+def is_art_cmd(message: Message) -> bool:
+    text = get_text(message)
+    return bool(text) and re.match(r"^/(арт|art)(@\w+)?(\s|$)", text.strip(), flags=re.I) is not None
 
+# Бот генерирует изображение при команде /art /арт (экспериментальная функция):
+@dp.message(F.chat.type.in_({"group", "supergroup"}), is_art_cmd)
+async def on_art(message: Message):
+    # тот же гейт по GROUP_ID, что и у других команд
+    if message.chat.type in {"group", "supergroup"} and GROUP_ID and str(message.chat.id) != GROUP_ID:
+        return
+
+    text = get_text(message)
+    if not text:
+        return
+
+    topic = re.sub(r"^/(арт|art)(@\w+)?", "", text.strip(), flags=re.I).strip()
+
+    # если пусто — берём текст из reply
+    if not topic and message.reply_to_message:
+        topic = get_text(message.reply_to_message) or ""
+
+    if not topic:
+        await message.reply("Не указан промпт, что нарисовать")
+        return
+
+    try:
+        img_bytes = await generate_image(topic)
+    except Exception:
+        logging.exception("Возникла ошибка при генерации картинки.")
+        await message.reply("Возникла ошибка при генерации картинки. Попробуйте позже.")
+        return
+
+    from aiogram.types import BufferedInputFile
+    photo = BufferedInputFile(img_bytes, filename="art.png")
+    try:
+        await message.reply_photo(photo, caption=f"🎨 {topic[:900]}")
+    except Exception:
+        logging.exception("Ошибка отправки картинки.")
+        await message.reply("Картинка получилась, но отправить не удалось.")
+
+# Функция проверяет, есть ли в сообщении команда /zen /притча:
+def is_zen_cmd(message: Message) -> bool:
+    text = get_text(message)
+    return bool(text) and re.match(r"^/(zen|притча)(@[\w_]+)?(\s|$)", text.strip(), flags=re.I) is not None
+
+# Бот отвечает в чате при /zen /притча:
+@dp.message(F.chat.type.in_({"group", "supergroup"}), is_zen_cmd)
+async def on_zen(message: Message):
+    if message.chat.type in {"group", "supergroup"} and GROUP_ID and str(message.chat.id) != GROUP_ID:
+        return
+
+    context_text = None
+    if message.reply_to_message:
+        context_text = get_text(message.reply_to_message)
+
+    topic = re.sub(r"^/(zen|притча)(@[\w_]+)?", "", get_text(message).strip(), flags=re.I).strip()
+
+    try:
+        answer = await ask_ai(topic, context_text, ZEN_PROMPT)
+    except Exception:
+        logging.exception("Ошибка при ответе ИИ на команду генерации zen-притчи.")
+        answer = "Месите же глину! - воскликнул гончар. Но был в тот момент недоступен Хайям.."
+    if answer:
+        for i in range(0, len(answer), MAX_LENGTH):
+            chunk = answer[i:i + MAX_LENGTH]
+            await message.reply(chunk)
+
+# Функция проверяет, есть ли в сообщении команда /advaita /адвайта:
+def is_advaita_cmd(message: Message) -> bool:
+    text = get_text(message)
+    return bool(text) and re.match(r"^/(advaita|адвайта)(@[\w_]+)?(\s|$)", text.strip(), flags=re.I) is not None
+
+# Бот отвечает в чате при /advaita /адвайта:
+@dp.message(F.chat.type.in_({"group", "supergroup"}), is_advaita_cmd)
+async def on_advaita(message: Message):
+    if message.chat.type in {"group", "supergroup"} and GROUP_ID and str(message.chat.id) != GROUP_ID:
+        return
+
+    context_text = None
+    if message.reply_to_message:
+        context_text = get_text(message.reply_to_message)
+
+    topic = re.sub(r"^/(advaita|адвайта)(@[\w_]+)?", "", get_text(message).strip(), flags=re.I).strip()
+
+    try:
+        answer = await ask_ai(topic, context_text, ADVAITA_PROMPT)
+    except Exception:
+        logging.exception("Ошибка при ответе ИИ на команду генерации advaita-притчи.")
+        answer = "Месите же глину! - воскликнул гончар. Но был в тот момент недоступен Хайям.."
+    if answer:
+        for i in range(0, len(answer), MAX_LENGTH):
+            chunk = answer[i:i + MAX_LENGTH]
+            await message.reply(chunk)
+
+# Функция проверяет, есть ли в сообщении команда /haiam /хайям:
+def is_haiam_cmd(message: Message) -> bool:
+    text = get_text(message)
+    return bool(text) and re.match(r"^/(haiam|хайям)(@[\w_]+)?(\s|$)", text.strip(), flags=re.I) is not None
+
+# Бот отвечает в чате при /haiam /хайям:
+@dp.message(F.chat.type.in_({"group", "supergroup"}), is_haiam_cmd)
+async def on_haiam(message: Message):
+    if message.chat.type in {"group", "supergroup"} and GROUP_ID and str(message.chat.id) != GROUP_ID:
+        return
+
+    context_text = None
+    if message.reply_to_message:
+        context_text = get_text(message.reply_to_message)
+
+    topic = re.sub(r"^/(haiam|хайям)(@[\w_]+)?", "", get_text(message).strip(), flags=re.I).strip()
+
+    try:
+        answer = await ask_ai(topic, context_text, HAIAM_PROMPT)
+    except Exception:
+        logging.exception("Ошибка при ответе ИИ на команду генерации Хайям-стиха.")
+        answer = "Месите же глину! - воскликнул гончар. Но был в тот момент недоступен Хайям.."
+    if answer:
+        for i in range(0, len(answer), MAX_LENGTH):
+            chunk = answer[i:i + MAX_LENGTH]
+            await message.reply(chunk)
+
+# Функция проверяет, есть ли в сообщении команда /therian /териан:
+def is_therian_cmd(message: Message) -> bool:
+    text = get_text(message)
+    return bool(text) and re.match(r"^/(therian|териан)(@[\w_]+)?(\s|$)", text.strip(), flags=re.I) is not None
+
+# Бот отвечает в чате при /therian /териан:
+@dp.message(F.chat.type.in_({"group", "supergroup"}), is_therian_cmd)
+async def on_therian(message: Message):
+    if message.chat.type in {"group", "supergroup"} and GROUP_ID and str(message.chat.id) != GROUP_ID:
+        return
+
+    context_text = None
+    if message.reply_to_message:
+        context_text = get_text(message.reply_to_message)
+
+    topic = re.sub(r"^/(therian|териан)(@[\w_]+)?", "", get_text(message).strip(), flags=re.I).strip()
+
+    try:
+        answer = await ask_ai(topic, context_text, THERIAN_PROMPT)
+    except Exception:
+        logging.exception("Ошибка при ответе ИИ на команду генерации Therian-ответа.")
+        answer = "Волки убежали и временно недоступны."
+    if answer:
+        for i in range(0, len(answer), MAX_LENGTH):
+            chunk = answer[i:i + MAX_LENGTH]
+            await message.reply(chunk)
+
+# Функция проверяет, есть ли в сообщении команда /стих /poem:
+def is_poem_cmd(message: Message) -> bool:
+    text = get_text(message)
+    return bool(text) and re.match(r"^/(стих|poem)(@[\w_]+)?(\s|$)", text.strip(), flags=re.I) is not None
+
+# Бот отвечает в чате при /стих /poem:
+@dp.message(F.chat.type.in_({"group", "supergroup"}), is_poem_cmd)
+async def on_poem(message: Message):
+    if message.chat.type in {"group", "supergroup"} and GROUP_ID and str(message.chat.id) != GROUP_ID:
+        return
+
+    context_text = None
+    if message.reply_to_message:
+        context_text = get_text(message.reply_to_message)
+
+    topic = re.sub(r"^/(стих|poem)(@[\w_]+)?", "", get_text(message).strip(), flags=re.I).strip()
+
+    try:
+        answer = await ask_ai(topic, context_text, POEM_PROMPT)
+    except Exception:
+        logging.exception("Ошибка при ответе ИИ на команду генерации стиха.")
+        answer = "Месите же глину! - воскликнул гончар. Но был в тот момент недоступен Хайям.."
+    if answer:
+        for i in range(0, len(answer), MAX_LENGTH):
+            chunk = answer[i:i + MAX_LENGTH]
+            await message.reply(chunk)
+
+# Функция проверяет, есть ли в сообщении команда /гачи /gachi:
+def is_gachi_cmd(message: Message) -> bool:
+    text = get_text(message)
+    return bool(text) and re.match(r"^/(гачи|gachi)(@[\w_]+)?(\s|$)", text.strip(), flags=re.I) is not None
+
+# Бот отвечает в чате при /гачи /gachi:
+@dp.message(F.chat.type.in_({"group", "supergroup"}), is_gachi_cmd)
+async def on_gachi(message: Message):
+    if message.chat.type in {"group", "supergroup"} and GROUP_ID and str(message.chat.id) != GROUP_ID:
+        return
+
+    context_text = None
+    if message.reply_to_message:
+        context_text = get_text(message.reply_to_message)
+
+    topic = re.sub(r"^/(гачи|gachi)(@[\w_]+)?", "", get_text(message).strip(), flags=re.I).strip()
+
+    try:
+        answer = await ask_ai(topic, context_text, GACHI_PROMPT)
+    except Exception:
+        logging.exception("Ошибка при ответе ИИ на команду генерации стиха.")
+        answer = "Месите же глину! - воскликнул гончар. Но был в тот момент недоступен Хайям.."
+    if answer:
+        for i in range(0, len(answer), MAX_LENGTH):
+            chunk = answer[i:i + MAX_LENGTH]
+            await message.reply(chunk)
+
+# Функция проверяет, есть ли в сообщении упоминание ника бота:
 def is_mention(message: Message) -> bool:
     text = get_text(message)
-    return (
-        bool(BOT_USERNAME)
-        and bool(text)
-        and not message.is_automatic_forward
-        and f"@{BOT_USERNAME}".lower() in text.lower()
-    )
+    return bool(BOT_USERNAME) and bool(text) and not message.is_automatic_forward and f"@{BOT_USERNAME}".lower() in text.lower()
 
+# Бот отвечает в чате при упоминании ника бота:
 @dp.message(F.chat.type.in_({"group", "supergroup"}), is_mention)
 async def on_mention(message: Message):
     if GROUP_ID and str(message.chat.id) != GROUP_ID:
@@ -297,20 +558,20 @@ async def on_mention(message: Message):
 
     query = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", get_text(message), flags=re.I).strip()
     if not query and not context_text:
-        await message.reply("Бот упомянут без query и контекста.")
+        await message.reply("Все команды: /zen, /advaita, /gachi, /стих, /хайям, /therian. | /art не работает. | Мой промпт: дружественный проработанный монах-технарь, шарю за науку/новости/genshin/интернет.")
         return
 
     try:
         answer = await ask_ai(query, context_text)
     except Exception:
         logging.exception("Ошибка во время ask_ai.")
-        answer = "Ai недоступны, попробуйте позже."
+        answer = "Кабир созерцал райские сады, и не смог ответить."
     if answer:
         for i in range(0, len(answer), MAX_LENGTH):
             chunk = answer[i:i + MAX_LENGTH]
             await message.reply(chunk)
 
-# Лог необработанных сообщений для отладки:
+# Лог всех необработанных сообщений:
 @dp.message()
 async def debug_unhandled(message: Message):
     logging.info(
